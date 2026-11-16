@@ -46,7 +46,7 @@ template <int N> class LBFGS {
     LBFGS() : max_iter_(500), tol_(1e-5), step_(1e-2) { }
     LBFGS(int max_iter, double tol, double step, int mem_size) :
         max_iter_(max_iter), tol_(tol), step_(step), mem_size_(mem_size) {
-        fdapde_assert(mem_size_ >= 0);
+        fdapde_assert(mem_size_ > 0);
     }
     LBFGS(const LBFGS& other) :
         max_iter_(other.max_iter_), tol_(other.tol_), step_(other.step_), mem_size_(other.mem_size_) { }
@@ -63,16 +63,23 @@ template <int N> class LBFGS {
           std::is_same<decltype(std::declval<ObjectiveT>().operator()(vector_t())) FDAPDE_COMMA double>::value,
           INVALID_CALL_TO_OPTIMIZE__OBJECTIVE_FUNCTOR_NOT_CALLABLE_AT_VECTOR_TYPE);
         constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
+        constexpr double curvature_tol = 1e-12;
         std::tuple<Callbacks...> callbacks_ {callbacks...};
         bool stop = false;   // asserted true in case of forced stop
         double error = std::numeric_limits<double>::max();
+        int n_pairs = 0;
         double gamma = 1.0;
         int size = N == Dynamic ? x0.rows() : N;
         auto grad = objective.gradient();
         h = step_;
         n_iter_ = 0;
+        values_.clear();
         x_old = x0, x_new = vector_t::Constant(size, NaN);
         grad_old = grad(x_old), grad_new = vector_t::Constant(size, NaN);
+        if (!grad_old.allFinite()) {
+            throw std::runtime_error("LBFGS: non-finite initial gradient");
+        }
+
         update = -grad_old;
         stop |= internals::exec_grad_hooks(*this, objective, callbacks_);
         error = grad_old.norm();
@@ -81,39 +88,103 @@ template <int N> class LBFGS {
         grad_mem_.resize(x0.rows(), mem_size_);
 
         while (n_iter_ < max_iter_ && error > tol_ && !stop) {
+            // Ensure descent direction
+            const double directional_derivative = grad_old.dot(update);
+             if (!update.allFinite() || !std::isfinite(directional_derivative) || directional_derivative >= 0.0) {
+                // Restart L-BFGS
+                n_pairs = 0;
+                gamma = 1.0;
+                update = -grad_old;
+            }
+
+            //Linesearch
             stop |= internals::exec_adapt_hooks(*this, objective, callbacks_);
+            if (stop) break;
+
+            if (!std::isfinite(h) || h <= 0.0) {
+                throw std::runtime_error("LBFGS: invalid step size");
+            }
+
             // update along descent direction
             x_new = x_old + h * update;
             grad_new = grad(x_new);
-	    // prepare next iteration
-            // update inverse Hessian approximation
-            int col_idx = n_iter_ % mem_size_;
-            grad_mem_.col(col_idx) = grad_new - grad_old;
-            x_mem_.col(col_idx) = x_new - x_old;
-            gamma = x_mem_.col(col_idx).dot(grad_mem_.col(col_idx)) / grad_mem_.col(col_idx).norm();
-            // compute update direction
+
+            if (!grad_new.allFinite()) {
+                throw std::runtime_error("LBFGS: non-finite gradient");
+            }
+
+             // Curvature pair
+            vector_t s = x_new - x_old;
+            if (s.norm() == 0.0) {
+                throw std::runtime_error("LBFGS: numerical stagnation");
+            }
+            vector_t y = grad_new - grad_old;
+            const double sy = s.dot(y);
+            const double yy = y.squaredNorm();
+	        const double snorm = s.norm();
+            const double ynorm = y.norm();
+            
+            const bool valid_pair = std::isfinite(sy) && std::isfinite(snorm) && std::isfinite(ynorm) && 
+                                    snorm > 0.0 && ynorm > 0.0 && 
+                                    sy > curvature_tol * snorm * ynorm;
+            
+            if (valid_pair) {
+                // Circular buffer indexed by accepted pairs
+                const int col_idx = n_pairs % mem_size_;
+
+                x_mem_.col(col_idx) = s;
+                grad_mem_.col(col_idx) = y;
+
+                ++n_pairs;
+
+                const double candidate = sy / yy;
+
+                if (std::isfinite(candidate) && candidate > 0.0) { 
+                    gamma = candidate;
+                } else {
+                    gamma = 1.0;
+                }
+            }
+            
+            int current_mem = std::min(n_pairs, mem_size_);
+            
+            // Two-loop recursion
             vector_t q = grad_new;
-	    n_iter_++;
-            int current_mem = n_iter_ < mem_size_ ? n_iter_: mem_size_;
+	        
             std::vector<double> alpha(current_mem, 0);
-            for (int i = 0; std::cmp_less(i, current_mem); ++i) {
-                int k = (n_iter_ + mem_size_ - i - 1) % mem_size_;
+            // First loop
+            for (int i = 0; i < current_mem; ++i) {
+                int k = (n_pairs - i - 1) % mem_size_;
                 alpha[i] = x_mem_.col(k).dot(q) / grad_mem_.col(k).dot(x_mem_.col(k));
                 q -= alpha[i] * grad_mem_.col(k);
             }
-            // H_0^k = I (initial guess of the inverse hessian)
-            update = -gamma * q;
+            // Initial inverse Hessian approximation: H_0^k = gamma * I
+            vector_t r = gamma * q;
+            //Second loop
             for (int i = current_mem - 1; i >= 0; --i) {
-                int k = (n_iter_ + mem_size_ - i - 1) % mem_size_;
-                double beta = grad_mem_.col(k).dot(update) / grad_mem_.col(k).dot(x_mem_.col(k));
-                update -= x_mem_.col(k) * (alpha[i] + beta);
+
+                int k = (n_pairs - i - 1) % mem_size_;
+                double beta = grad_mem_.col(k).dot(r) / grad_mem_.col(k).dot(x_mem_.col(k));
+                r += x_mem_.col(k) * (alpha[i] - beta);
             }
+            update = -r;
+
+
+            const double dphi_new = grad_new.dot(update);
+            if (!update.allFinite() || !std::isfinite(dphi_new) || dphi_new >= 0.0) {
+                n_pairs = 0;
+                gamma = 1.0;
+                update = -grad_new;
+            }
+
+            ++n_iter_;
+
             stop |=
               (internals::exec_grad_hooks(*this, objective, callbacks_) || internals::exec_stop_if(*this, objective));
             x_old = x_new;
             grad_old = grad_new;
             error = grad_new.norm();
-	    values_.push_back(objective(x_old));
+	        values_.push_back(objective(x_old));
         }
         optimum_ = x_old;
         value_ = values_.back();
@@ -123,6 +194,7 @@ template <int N> class LBFGS {
     vector_t optimum() const { return optimum_; }
     double value() const { return value_; }
     int n_iter() const { return n_iter_; }
+
     const std::vector<double>& values() const { return values_; }
 };
 

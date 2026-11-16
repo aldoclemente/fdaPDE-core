@@ -42,15 +42,16 @@ template <typename Opt> static constexpr bool is_gradient_free_opt_v = is_gradie
 #include "src/optimization/callbacks.h"
 #include "src/optimization/backtracking.h"
 #include "src/optimization/wolfe.h"
+#include "src/optimization/wolfe_nocedal.h"
 
 // algorithms
 #include "src/optimization/grid_search.h"
-// #include "src/optimization/newton.h"
-// #include "src/optimization/gradient_descent.h"
-// #include "src/optimization/conjugate_gradient.h"
-// #include "src/optimization/bfgs.h"
-// #include "src/optimization/lbfgs.h"
-// #include "src/optimization/nelder_mead.h"
+#include "src/optimization/newton.h"
+#include "src/optimization/gradient_descent.h"
+#include "src/optimization/conjugate_gradient.h"
+#include "src/optimization/bfgs.h"
+#include "src/optimization/lbfgs.h"
+#include "src/optimization/nelder_mead.h"
 
 // clang-format on
 
